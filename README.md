@@ -29,6 +29,16 @@ Buttons (and keys): **● Start** `s` · **■ Stop** `s` · **★ Mark** `m` ·
   the mic from `~/lectures/.config.json`.
 - One ffmpeg process feeds both the opus archive (~11 MB/hour) and the live
   PCM stream, so the mic is opened once.
+- **Suspend is blocked while recording.** A closed lid used to end the capture
+  silently — logind takes the machine down, PulseAudio goes with it, ffmpeg
+  exits. scribe now holds a `sleep:idle:handle-lid-switch` inhibitor for the
+  length of the recording. The lock is held by a `cat` reading a pipe scribe
+  owns, so it dies with the app even under SIGKILL — an inhibitor that outlives
+  the process would leave the machine unable to sleep at all.
+- **If the input dies anyway, it reconnects.** The capture loop notices ffmpeg
+  exiting, says so loudly in the UI, and reopens into `…part2.ogg`,
+  `…part3.ogg` and so on. Export stitches every segment into one timeline with
+  the offsets applied, and lists them all in the note's frontmatter.
 - Live transcription cuts on natural pauses (energy VAD with a running noise
   floor), so chunks land between sentences. Roughly 10-20 s behind the speaker.
 - **Mark** drops a `★` at the current moment; marks come out in the exported
@@ -94,6 +104,8 @@ it runs ~30-40x realtime, so a 75-minute lecture exports in about two minutes.
 
 - No pause/resume, no session browser, no way to export an older recording from
   inside the app.
+- A gap in a recording (input lost for 40 s) is stitched out, not marked. The
+  exported timeline is shorter than the wall clock and nothing says where.
 - Speaker names, slide/screen capture, and a summariser pass are all obvious
   next steps and none of them exist.
 - Recording a class needs the instructor's okay. The app doesn't say so anywhere.

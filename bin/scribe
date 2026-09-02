@@ -180,6 +180,9 @@ class Scribe(App):
         self.proc = None
         self.stop_flag = threading.Event()
         self.audio_path = None
+        self.segments = []
+        self.inhibitor = None
+        self.inhibit_fd = None
         self.started_at = None
         self.marks = []
         self.live_lines = []
@@ -299,7 +302,9 @@ class Scribe(App):
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
         self.audio_path = os.path.join(AUDIO_DIR, f"{stamp}_{course}.ogg")
         self.marks, self.live_lines = [], []
+        self.segments = [self.audio_path]
         self.started_at = time.time()
+        self._inhibit_sleep()
         self.stop_flag.clear()
         self.recording = True
         self.query_one("#log", RichLog).write(
@@ -316,6 +321,7 @@ class Scribe(App):
                 self.proc.send_signal(signal.SIGINT)
             except Exception:
                 pass
+        self._release_sleep()
         self.recording = False
         mins = (time.time() - self.started_at) / 60
         self.query_one("#log", RichLog).write(
@@ -362,23 +368,122 @@ class Scribe(App):
         self.query_one("#log", RichLog).write(
             f"[#ffb000]{stamp}[/][dim] │ [/]{text}")
         self.live_lines.append((stamp, text))
+        # mirror to disk, so a crash costs the pane and not the words
+        if self.audio_path:
+            try:
+                with open(self.audio_path[:-4] + ".live.txt", "a") as f:
+                    f.write(f"[{stamp}] {text}\n")
+            except Exception:
+                pass
+
+    # -------------------------------------------------- suspend inhibitor
+    def _inhibit_sleep(self):
+        """Hold a logind lock so closing the lid can't kill the recording.
+        Learned the hard way: a lid close at 13:22 ended a lecture capture and
+        nothing noticed for an hour."""
+        try:
+            # The lock is held by `cat` reading a pipe we own. However this
+            # process dies — cleanly, crash, SIGKILL — the write end closes,
+            # cat sees EOF and exits, and the lock goes with it. An inhibitor
+            # that outlives the app would leave the machine unable to sleep.
+            r, w = os.pipe()
+            self.inhibitor = subprocess.Popen(
+                ["systemd-inhibit", "--what=sleep:idle:handle-lid-switch",
+                 "--who=scribe", "--why=recording a lecture", "--mode=block",
+                 "cat"],
+                stdin=r, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            os.close(r)
+            self.inhibit_fd = w
+        except Exception as e:
+            self.inhibitor = None
+            self._status(f"could not inhibit sleep ({e}) — don't close the lid")
+
+    def _release_sleep(self):
+        if getattr(self, "inhibit_fd", None) is not None:
+            try:
+                os.close(self.inhibit_fd)
+            except Exception:
+                pass
+            self.inhibit_fd = None
+        if self.inhibitor and self.inhibitor.poll() is None:
+            try:
+                self.inhibitor.wait(timeout=5)
+            except Exception:
+                self.inhibitor.kill()
+        self.inhibitor = None
 
     # ------------------------------------------------------------ capture
+    def _next_segment(self):
+        base = self.audio_path[:-4] if self.audio_path.endswith(".ogg") \
+            else self.audio_path
+        path = f"{base}.part{len(self.segments) + 1}.ogg"
+        self.segments.append(path)
+        return path
+
+    def _input_lost(self, attempt):
+        self.query_one("#state", Static).update("⚠ INPUT LOST")
+        self.query_one("#log", RichLog).write(
+            f"[bold red]⚠ audio input died[/] — reconnecting "
+            f"(attempt {attempt})")
+        if attempt == 1:
+            self.notify("audio input died — reconnecting",
+                        severity="warning", timeout=10)
+
+    def _input_back(self, path):
+        self.query_one("#state", Static).update("● REC")
+        self.query_one("#log", RichLog).write(
+            f"[bold green]● recording again[/] → [dim]{path}[/]")
+        self.notify("recording again")
+
+    def _capture_gave_up(self):
+        self._release_sleep()
+        self.recording = False
+        self.query_one("#log", RichLog).write(
+            "[bold red]■ recording stopped: the audio input never came back.[/] "
+            "Check `scribe`'s mic picker, then Start again.")
+        self.notify("recording stopped — input gone", severity="error",
+                    timeout=0)
+
     @work(thread=True, group="capture")
     def capture(self):
         import numpy as np
+        path, attempt = self.audio_path, 0
+        while not self.stop_flag.is_set():
+            secs = self._capture_once(path, np)
+            if self.stop_flag.is_set():
+                break
+            # ffmpeg exited on its own: the source went away (suspend, device
+            # unplugged, PipeWire restart). Reopen into a new segment.
+            attempt = 1 if secs > 30 else attempt + 1
+            if attempt > 40:
+                self.call_from_thread(self._capture_gave_up)
+                return
+            self.call_from_thread(self._input_lost, attempt)
+            time.sleep(2.0)
+            if self.stop_flag.is_set():
+                break
+            path = self._next_segment()
+            self.call_from_thread(self._input_back, path)
+        self.call_from_thread(self._release_sleep)
+
+    def _capture_once(self, path, np):
+        """Record one segment. Returns seconds of audio actually read."""
         cmd = ["ffmpeg", "-nostdin", "-loglevel", "error",
                "-f", "pulse", "-i", self.device,
                "-ac", "1", "-ar", str(RATE), "-c:a", "libopus", "-b:a", "24k",
                # flush every packet so a crash costs seconds, not minutes
-               "-flush_packets", "1", self.audio_path,
+               "-flush_packets", "1", path,
                "-ac", "1", "-ar", str(RATE), "-f", "s16le", "pipe:1"]
+        errlog = open(os.path.join(AUDIO_DIR, ".ffmpeg.log"), "ab")
+        errlog.write(f"\n=== {datetime.datetime.now():%F %T} {path}\n"
+                     .encode())
+        errlog.flush()
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL,
-                                     stdin=subprocess.DEVNULL)
+                                     stderr=errlog, stdin=subprocess.DEVNULL)
         floor, buf, pre = None, [], []
         speaking, quiet_for, said = False, 0.0, ""
         nbytes, dt = FRAME * 2, FRAME / RATE
+        frames = 0
 
         def flush(chunk):
             nonlocal said
@@ -405,6 +510,7 @@ class Scribe(App):
                 raw = self.proc.stdout.read(nbytes)
                 if not raw or len(raw) < nbytes:
                     break
+                frames += 1
                 f = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
                 rms = math.sqrt(float(np.mean(f * f)) + 1e-9)
                 floor = rms if floor is None else (
@@ -435,10 +541,14 @@ class Scribe(App):
             if speaking and buf:
                 flush(buf)
         finally:
-            try:
-                self.proc.wait(timeout=10)
-            except Exception:
-                self.proc.kill()
+            if self.proc.poll() is None:
+                try:
+                    self.proc.send_signal(signal.SIGINT)
+                    self.proc.wait(timeout=10)
+                except Exception:
+                    self.proc.kill()
+            errlog.close()
+        return frames * dt
 
     # ------------------------------------------------------------- export
     def export(self):
@@ -448,19 +558,18 @@ class Scribe(App):
         self._refresh_export()
         self.query_one("#log", RichLog).write(
             "[dim]exporting — full-quality pass over the whole recording…[/]")
-        self.export_worker(self.audio_path,
+        self.export_worker([p for p in self.segments if os.path.exists(p)
+                            and os.path.getsize(p) > 0],
                            self.query_one("#course", Select).value,
                            list(self.marks), self.recording)
 
     @work(thread=True, group="export")
-    def export_worker(self, path, course, marks, partial):
+    def export_worker(self, paths, course, marks, partial):
         t0 = time.time()
         try:
-            segs, info = self.model.transcribe(
-                path, language="en", beam_size=1, vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 700},
-                condition_on_previous_text=False)
-            note, words = write_note(path, course, segs, info, marks, partial)
+            segs, duration = transcribe_all(self.model, paths)
+            note, words = write_note(paths, course, segs, duration, marks,
+                                     partial)
         except Exception as e:
             self.call_from_thread(self._status, f"export failed: {e}")
             self.call_from_thread(self._done_export, None, 0, 0)
@@ -500,7 +609,34 @@ def blocks(segments, marks, span=45.0):
         yield start, " ".join(cur), marks[mi:]
 
 
-def write_note(path, course, segs, info, marks, partial):
+class _Shift:
+    """A whisper segment moved along the timeline of a stitched recording."""
+    __slots__ = ("start", "end", "text")
+
+    def __init__(self, seg, offset):
+        self.start = seg.start + offset
+        self.end = seg.end + offset
+        self.text = seg.text
+
+
+def transcribe_all(model, paths):
+    """Transcribe every segment of a session end to end, as one timeline.
+
+    A recording gains extra segments whenever the audio input dies and comes
+    back (suspend, unplugged mic, PipeWire restart)."""
+    out, offset = [], 0.0
+    for path in paths:
+        segs, info = model.transcribe(
+            path, language="en", beam_size=1, vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 700},
+            condition_on_previous_text=False)
+        out.extend(_Shift(s, offset) for s in segs)
+        offset += info.duration
+    return out, offset
+
+
+def write_note(paths, course, segs, duration, marks, partial):
+    path = paths[0]
     body, words = [], 0
     for start, text, hit in blocks(segs, marks):
         stamp = f"{int(start) // 60:02d}:{int(start) % 60:02d}"
@@ -519,8 +655,9 @@ def write_note(path, course, segs, info, marks, partial):
     with open(note, "w") as f:
         f.write(
             f"---\ncourse: {course}\ndate: {date:%Y-%m-%d}\n"
-            f"duration_min: {info.duration / 60:.0f}\n"
-            f"marks: {len(marks)}\naudio: \"{path}\"\n"
+            f"duration_min: {duration / 60:.0f}\n"
+            f"marks: {len(marks)}\n"
+            + "audio:\n" + "".join(f"  - \"{p}\"\n" for p in paths) +
             f"tags:\n  - college/lecture\n---\n\n"
             f"# {course} — {date:%a %b %-d, %Y}\n\n"
             f"Raw auto-transcript (whisper large-v3-turbo, local"
