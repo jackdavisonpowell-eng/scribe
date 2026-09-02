@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""scribe — a terminal app for recording, live-transcribing and exporting lectures.
+
+  scribe                 open the app
+  scribe --autostart     begin recording as soon as whisper is loaded
+  scribe --device NAME   force a specific PulseAudio input
+
+Buttons (and keys): Start [s] · Stop [s] · Mark [m] · Export [e] · Quit [q].
+Everything runs locally: ffmpeg for capture, faster-whisper large-v3-turbo on
+the GPU for transcription, notes written into the Obsidian vault.
+"""
+import os, sys, glob, json, math, queue, shutil, signal, subprocess, threading
+import time, datetime, re
+
+HOME = os.path.expanduser("~")
+# --------------------------------------------------------------- config
+# Everything personal lives in a config file, not in this script.
+# See config.example.json.  Override the path with $SCRIBE_CONFIG.
+CONFIG_PATH = os.path.expanduser(
+    os.environ.get("SCRIBE_CONFIG", "~/.config/scribe/config.json"))
+
+DEFAULTS = {
+    "audio_dir": "~/lectures",
+    "vault": "~/vault/Lectures",
+    "model": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+    "device": "default",
+    "courses": [],
+    # [{"course": "PHYS-101", "days": [0, 2, 4], "start": "10:20",
+    #   "end": "11:15"}] — days are 0=Mon .. 6=Sun
+    "schedule": [],
+    "grace_before_min": 25,
+    "grace_after_min": 20,
+}
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"warning: ignoring bad config {CONFIG_PATH}: {e}",
+              file=sys.stderr)
+    cfg["audio_dir"] = os.path.expanduser(cfg["audio_dir"])
+    cfg["vault"] = os.path.expanduser(cfg["vault"])
+    return cfg
+
+
+def save_config(**kw):
+    cfg = {}
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+    except Exception:
+        pass
+    cfg.update(kw)
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+CFG = load_config()
+AUDIO_DIR = CFG["audio_dir"]
+VAULT = CFG["vault"]
+MODEL = CFG["model"]
+
+
+RATE, FRAME = 16000, 512
+SIL_HANG, MIN_CHUNK, MAX_CHUNK, PREROLL = 0.8, 3.0, 22.0, 0.4
+
+COURSES = list(CFG["courses"]) + ["Lecture"]
+
+
+# ----------------------------------------------------------------- helpers
+def reexec_with_cuda():
+    """ctranslate2 finds the pip CUDA libs only via LD_LIBRARY_PATH, which the
+    dynamic loader reads at exec time — so re-exec ourselves once, up front."""
+    libs = sorted(glob.glob(os.path.join(
+        HOME, ".local/lib/python3*/site-packages/nvidia/*/lib")))
+    if not libs or os.environ.get("_LECTURE_CUDA"):
+        return
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = ":".join(libs + [env.get("LD_LIBRARY_PATH", "")])
+    env["_LECTURE_CUDA"] = "1"
+    os.execve(sys.executable,
+              [sys.executable, os.path.abspath(__file__)] + sys.argv[1:], env)
+
+
+def _hm(s):
+    h, m = s.split(":")
+    return int(h) * 60 + int(m)
+
+
+def guess_course(now=None):
+    """Nearest scheduled class to `now`, or "Lecture" if nothing is close."""
+    now = now or datetime.datetime.now()
+    mins = now.hour * 60 + now.minute
+    before, after = CFG["grace_before_min"], CFG["grace_after_min"]
+    best, dist = None, 10 ** 9
+    for entry in CFG["schedule"]:
+        if now.weekday() not in entry.get("days", []):
+            continue
+        s, e = _hm(entry["start"]), _hm(entry["end"])
+        if s - before <= mins <= e + after:
+            d = 0 if s <= mins <= e else min(abs(mins - s), abs(mins - e))
+            if d < dist:
+                best, dist = entry["course"], d
+    return best or "Lecture"
+
+
+def hhmmss(sec):
+    sec = int(sec)
+    return f"{sec // 3600:d}:{sec // 60 % 60:02d}:{sec % 60:02d}"
+
+
+def input_devices():
+    try:
+        out = subprocess.run(["pactl", "-f", "json", "list", "sources"],
+                             capture_output=True, text=True).stdout
+        out = [(s.get("description") or s["name"], s["name"])
+               for s in json.loads(out) if not s["name"].endswith(".monitor")]
+        return [(d if len(d) <= 26 else d[:25] + "…", n) for d, n in out]
+    except Exception:
+        return []
+
+
+def saved_device():
+    if "--device" in sys.argv:
+        return sys.argv[sys.argv.index("--device") + 1]
+    return load_config().get("device", "default")
+
+
+def save_device(name):
+    save_config(device=name)
+
+
+# ------------------------------------------------------------------ the app
+from textual import on, work                                   # noqa: E402
+from textual.app import App, ComposeResult                     # noqa: E402
+from textual.containers import Horizontal, Vertical            # noqa: E402
+from textual.reactive import reactive                          # noqa: E402
+from textual.widgets import (Button, Footer, Header, Label,    # noqa: E402
+                             RichLog, Select, Static)
+
+
+class Scribe(App):
+    TITLE = "scribe"
+    SUB_TITLE = "lecture capture"
+    CSS = """
+    Screen { background: $surface; }
+    #bar { height: 3; padding: 0 1; background: $panel; }
+    #bar Label { padding: 1 2 0 0; }
+    #course { width: 24; }
+    #dev { width: 1fr; max-width: 34; }
+    #state { width: 20; content-align: right middle; text-style: bold; }
+    #clock { width: 12; content-align: right middle; text-style: bold;
+             color: $text-muted; }
+    #log { border: round $primary 30%; padding: 0 1; height: 1fr; }
+    #buttons { height: 3; padding: 0 1; align: left middle; }
+    #buttons Button { margin: 0 1 0 0; min-width: 14; }
+    #status { height: 1; padding: 0 1; color: $text-muted; }
+    .rec #state { color: $error; }
+    .idle #state { color: $text-muted; }
+    """
+    BINDINGS = [
+        ("s", "toggle", "Start/Stop"),
+        ("m", "mark", "Mark"),
+        ("e", "export", "Export"),
+        ("q", "quit", "Quit"),
+    ]
+
+    recording = reactive(False)
+
+    def __init__(self):
+        super().__init__()
+        self.model = None
+        self.model_where = "loading"
+        self.proc = None
+        self.stop_flag = threading.Event()
+        self.audio_path = None
+        self.started_at = None
+        self.marks = []
+        self.live_lines = []
+        self.device = saved_device()
+        self.exporting = False
+
+    # ------------------------------------------------------------- layout
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Horizontal(id="bar"):
+            yield Label("Class")
+            yield Select([(c, c) for c in COURSES], value=guess_course(),
+                         allow_blank=False, id="course")
+            yield Label("  Mic")
+            yield Select(input_devices() or [("default", "default")],
+                         value=self._initial_device(), allow_blank=False,
+                         id="dev")
+            yield Static("○ idle", id="state")
+            yield Static("0:00:00", id="clock")
+        yield RichLog(id="log", markup=True, wrap=True, auto_scroll=True)
+        with Horizontal(id="buttons"):
+            yield Button("● Start", id="start", variant="success")
+            yield Button("■ Stop", id="stop", variant="error", disabled=True)
+            yield Button("★ Mark", id="mark", disabled=True)
+            yield Button("⭳ Export", id="export", variant="primary",
+                         disabled=True)
+        yield Static("", id="status")
+        yield Footer()
+
+    def _initial_device(self):
+        devs = [v for _, v in input_devices()]
+        return self.device if self.device in devs else (devs[0] if devs
+                                                        else "default")
+
+    def on_mount(self):
+        self.theme = "gruvbox"
+        log = self.query_one("#log", RichLog)
+        log.write("[bold #ffb000]scribe[/] — local lecture capture")
+        log.write("[dim]Press Start (or s) when class begins. "
+                  "Transcript appears here a few seconds behind the speaker.[/]")
+        self.set_interval(1.0, self._tick)
+        self.load_model()
+        self._refresh_export()
+
+    # -------------------------------------------------------------- model
+    @work(thread=True, group="model")
+    def load_model(self):
+        from faster_whisper import WhisperModel
+        self.call_from_thread(self._status, "loading whisper large-v3-turbo…")
+        try:
+            try:
+                m = WhisperModel(MODEL, device="cuda", compute_type="float16")
+                where = "GPU"
+            except Exception as e:
+                m = WhisperModel(MODEL, device="cpu", compute_type="int8",
+                                 cpu_threads=os.cpu_count())
+                where = f"CPU (cuda: {type(e).__name__})"
+        except Exception as e:
+            self.call_from_thread(self._status, f"whisper failed to load: {e}")
+            self.call_from_thread(
+                self.notify, f"whisper failed to load: {e}", severity="error")
+            return
+        self.model, self.model_where = m, where
+        self.call_from_thread(self._status, f"whisper ready on {where}")
+        if "--autostart" in sys.argv and not self.recording:
+            self.call_from_thread(self.start)
+
+    # ------------------------------------------------------------ actions
+    def action_toggle(self):
+        self.stop() if self.recording else self.start()
+
+    def action_mark(self):
+        if not self.recording:
+            return
+        t = time.time() - self.started_at
+        self.marks.append(t)
+        self.query_one("#log", RichLog).write(
+            f"[#ffb000]★ mark at {hhmmss(t)}[/]")
+        self.notify(f"marked {hhmmss(t)}")
+
+    def action_export(self):
+        self.export()
+
+    @on(Button.Pressed, "#start")
+    def _b_start(self):
+        self.start()
+
+    @on(Button.Pressed, "#stop")
+    def _b_stop(self):
+        self.stop()
+
+    @on(Button.Pressed, "#mark")
+    def _b_mark(self):
+        self.action_mark()
+
+    @on(Button.Pressed, "#export")
+    def _b_export(self):
+        self.export()
+
+    @on(Select.Changed, "#dev")
+    def _dev_changed(self, ev: Select.Changed):
+        if ev.value and ev.value != self.device:
+            self.device = ev.value
+            save_device(ev.value)
+            self._status(f"input set to {ev.value}")
+
+    # ------------------------------------------------------- start / stop
+    def start(self):
+        if self.recording:
+            return
+        if self.model is None:
+            self.notify("whisper is still loading — one moment",
+                        severity="warning")
+            return
+        course = self.query_one("#course", Select).value
+        os.makedirs(AUDIO_DIR, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+        self.audio_path = os.path.join(AUDIO_DIR, f"{stamp}_{course}.ogg")
+        self.marks, self.live_lines = [], []
+        self.started_at = time.time()
+        self.stop_flag.clear()
+        self.recording = True
+        self.query_one("#log", RichLog).write(
+            f"\n[bold]● {course} [/]— recording to "
+            f"[dim]{self.audio_path}[/]\n")
+        self.capture()
+
+    def stop(self):
+        if not self.recording:
+            return
+        self.stop_flag.set()
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.send_signal(signal.SIGINT)
+            except Exception:
+                pass
+        self.recording = False
+        mins = (time.time() - self.started_at) / 60
+        self.query_one("#log", RichLog).write(
+            f"\n[bold]■ stopped [/]after {mins:.0f} min — "
+            f"press Export for the full-quality transcript\n")
+        self._refresh_export()
+
+    def watch_recording(self, rec: bool):
+        try:
+            self.query_one("#start", Button).disabled = rec
+            self.query_one("#stop", Button).disabled = not rec
+            self.query_one("#mark", Button).disabled = not rec
+            self.query_one("#course", Select).disabled = rec
+            self.query_one("#dev", Select).disabled = rec
+            self.query_one("#state", Static).update(
+                "● REC" if rec else "○ idle")
+            self.screen.set_class(rec, "rec")
+            self.screen.set_class(not rec, "idle")
+        except Exception:
+            pass
+        self._refresh_export()
+
+    def _refresh_export(self):
+        try:
+            self.query_one("#export", Button).disabled = (
+                self.exporting or not self.audio_path
+                or not os.path.exists(self.audio_path))
+        except Exception:
+            pass
+
+    def _tick(self):
+        if self.recording and self.started_at:
+            self.query_one("#clock", Static).update(
+                hhmmss(time.time() - self.started_at))
+        self._refresh_export()
+
+    def _status(self, text):
+        try:
+            self.query_one("#status", Static).update(text)
+        except Exception:
+            pass
+
+    def _line(self, stamp, text):
+        self.query_one("#log", RichLog).write(
+            f"[#ffb000]{stamp}[/][dim] │ [/]{text}")
+        self.live_lines.append((stamp, text))
+
+    # ------------------------------------------------------------ capture
+    @work(thread=True, group="capture")
+    def capture(self):
+        import numpy as np
+        cmd = ["ffmpeg", "-nostdin", "-loglevel", "error",
+               "-f", "pulse", "-i", self.device,
+               "-ac", "1", "-ar", str(RATE), "-c:a", "libopus", "-b:a", "24k",
+               # flush every packet so a crash costs seconds, not minutes
+               "-flush_packets", "1", self.audio_path,
+               "-ac", "1", "-ar", str(RATE), "-f", "s16le", "pipe:1"]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL,
+                                     stdin=subprocess.DEVNULL)
+        floor, buf, pre = None, [], []
+        speaking, quiet_for, said = False, 0.0, ""
+        nbytes, dt = FRAME * 2, FRAME / RATE
+
+        def flush(chunk):
+            nonlocal said
+            audio = np.concatenate(chunk).astype(np.float32) / 32768.0
+            if len(audio) < RATE * 0.8:
+                return
+            try:
+                segs, _ = self.model.transcribe(
+                    audio, language="en", beam_size=1, vad_filter=True,
+                    condition_on_previous_text=False,
+                    initial_prompt=said[-300:] or None)
+                text = " ".join(s.text.strip() for s in segs).strip()
+            except Exception as e:
+                self.call_from_thread(self._status, f"transcribe error: {e}")
+                return
+            if not text:
+                return
+            said = (said + " " + text)[-600:]
+            stamp = datetime.datetime.now().strftime("%H:%M:%S")
+            self.call_from_thread(self._line, stamp, text)
+
+        try:
+            while not self.stop_flag.is_set():
+                raw = self.proc.stdout.read(nbytes)
+                if not raw or len(raw) < nbytes:
+                    break
+                f = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                rms = math.sqrt(float(np.mean(f * f)) + 1e-9)
+                floor = rms if floor is None else (
+                    min(floor * 1.02, rms) if rms < floor
+                    else floor * 0.9999 + rms * 0.0001)
+                loud = rms > max(floor * 3.5, 120.0)
+
+                if loud:
+                    if not speaking:
+                        speaking, buf = True, list(pre)
+                    buf.append(f)
+                    quiet_for = 0.0
+                elif speaking:
+                    buf.append(f)
+                    quiet_for += dt
+                else:
+                    pre.append(f)
+                    if len(pre) > int(PREROLL / dt):
+                        pre.pop(0)
+
+                if speaking:
+                    held = len(buf) * dt
+                    if (quiet_for >= SIL_HANG and held >= MIN_CHUNK) \
+                            or held >= MAX_CHUNK:
+                        chunk, buf = buf, []
+                        speaking, quiet_for, pre = False, 0.0, []
+                        flush(chunk)
+            if speaking and buf:
+                flush(buf)
+        finally:
+            try:
+                self.proc.wait(timeout=10)
+            except Exception:
+                self.proc.kill()
+
+    # ------------------------------------------------------------- export
+    def export(self):
+        if self.exporting or not self.audio_path:
+            return
+        self.exporting = True
+        self._refresh_export()
+        self.query_one("#log", RichLog).write(
+            "[dim]exporting — full-quality pass over the whole recording…[/]")
+        self.export_worker(self.audio_path,
+                           self.query_one("#course", Select).value,
+                           list(self.marks), self.recording)
+
+    @work(thread=True, group="export")
+    def export_worker(self, path, course, marks, partial):
+        t0 = time.time()
+        try:
+            segs, info = self.model.transcribe(
+                path, language="en", beam_size=1, vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 700},
+                condition_on_previous_text=False)
+            note, words = write_note(path, course, segs, info, marks, partial)
+        except Exception as e:
+            self.call_from_thread(self._status, f"export failed: {e}")
+            self.call_from_thread(self._done_export, None, 0, 0)
+            return
+        self.call_from_thread(self._done_export, note, words, time.time() - t0)
+
+    def _done_export(self, note, words, el):
+        self.exporting = False
+        self._refresh_export()
+        if not note:
+            self.notify("export failed — see the status line",
+                        severity="error")
+            return
+        log = self.query_one("#log", RichLog)
+        log.write(f"[bold green]✓ exported[/] {words} words in {el:.0f}s")
+        log.write(f"[dim]{note}[/]")
+        self._status(f"written to {note}")
+        self.notify(f"exported → {os.path.basename(note)}")
+
+
+# ------------------------------------------------------------- note writer
+def blocks(segments, marks, span=45.0):
+    """Merge segments into ~45s paragraphs, dropping ★ marks in place."""
+    marks = sorted(marks)
+    cur, start, mi = [], None, 0
+    for s in segments:
+        if start is None:
+            start = s.start
+        cur.append(s.text.strip())
+        if s.end - start >= span:
+            hit = []
+            while mi < len(marks) and marks[mi] <= s.end:
+                hit.append(marks[mi]); mi += 1
+            yield start, " ".join(cur), hit
+            cur, start = [], None
+    if cur:
+        yield start, " ".join(cur), marks[mi:]
+
+
+def write_note(path, course, segs, info, marks, partial):
+    body, words = [], 0
+    for start, text, hit in blocks(segs, marks):
+        stamp = f"{int(start) // 60:02d}:{int(start) % 60:02d}"
+        body.append(f"**{stamp}** {text}")
+        words += len(text.split())
+        for m in hit:
+            body.append(f"> [!important] ★ marked at "
+                        f"{int(m) // 60:02d}:{int(m) % 60:02d}")
+    date = datetime.datetime.fromtimestamp(os.path.getmtime(path))
+    os.makedirs(VAULT, exist_ok=True)
+    note = os.path.join(VAULT, f"{date:%Y-%m-%d} {course}.md")
+    n = 2
+    while os.path.exists(note):
+        note = os.path.join(VAULT, f"{date:%Y-%m-%d} {course} ({n}).md")
+        n += 1
+    with open(note, "w") as f:
+        f.write(
+            f"---\ncourse: {course}\ndate: {date:%Y-%m-%d}\n"
+            f"duration_min: {info.duration / 60:.0f}\n"
+            f"marks: {len(marks)}\naudio: \"{path}\"\n"
+            f"tags:\n  - college/lecture\n---\n\n"
+            f"# {course} — {date:%a %b %-d, %Y}\n\n"
+            f"Raw auto-transcript (whisper large-v3-turbo, local"
+            f"{', partial — recording still running' if partial else ''}). "
+            f"Unedited — treat names and jargon as suspect.\n\n"
+            f"Class note: [[{course}]]\n\n" + "\n\n".join(body) + "\n")
+    return note, words
+
+
+if __name__ == "__main__":
+    reexec_with_cuda()
+    # Start multiprocessing's resource tracker now, while stderr is still a
+    # real fd — once Textual owns the terminal, sys.stderr.fileno() is -1 and
+    # anything that lazily spawns the tracker dies with "bad value(s) in
+    # fds_to_keep".
+    try:
+        from multiprocessing import resource_tracker
+        resource_tracker.ensure_running()
+    except Exception:
+        pass
+    Scribe().run()

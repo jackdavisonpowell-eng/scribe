@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""lecture-live — rolling live transcription of the mic, printed as it happens.
+
+Runs alongside `lecture` (a second PulseAudio capture; it does not touch the
+recording).  Cuts on natural pauses, transcribes each chunk on the GPU, prints
+it with a wall-clock stamp and appends it to ~/lectures/<stamp>.live.txt.
+
+  lecture-live            use the device `lecture mic` is set to
+  lecture-live --device NAME
+"""
+import os, sys, glob, json, time, math, shutil, subprocess, datetime, textwrap
+
+HOME = os.path.expanduser("~")
+AUDIO_DIR = os.path.join(HOME, "lectures")
+CONF = os.path.join(AUDIO_DIR, ".config.json")
+MODEL = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+
+RATE = 16000
+FRAME = 512                      # 32 ms
+SIL_HANG = 0.8                   # seconds of quiet that ends a chunk
+MIN_CHUNK = 3.0                  # don't flush shorter than this
+MAX_CHUNK = 22.0                 # ...or hold longer than this
+PREROLL = 0.4                    # audio kept from before speech started
+
+BOLD, DIM, AMBER, RESET = "\033[1m", "\033[2m", "\033[38;5;214m", "\033[0m"
+
+
+def reexec_with_cuda():
+    libs = sorted(glob.glob(os.path.join(
+        HOME, ".local/lib/python3*/site-packages/nvidia/*/lib")))
+    if not libs or os.environ.get("_LECTURE_CUDA"):
+        return
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = ":".join(libs + [env.get("LD_LIBRARY_PATH", "")])
+    env["_LECTURE_CUDA"] = "1"
+    sys.stdout.flush()
+    os.execve(sys.executable,
+              [sys.executable, os.path.abspath(__file__)] + sys.argv[1:], env)
+
+
+def device():
+    if "--device" in sys.argv:
+        return sys.argv[sys.argv.index("--device") + 1]
+    try:
+        return json.load(open(CONF)).get("device", "default")
+    except Exception:
+        return "default"
+
+
+def main():
+    reexec_with_cuda()
+    import numpy as np
+    from faster_whisper import WhisperModel
+
+    width = shutil.get_terminal_size((100, 30)).columns
+    print(f"{AMBER}{BOLD}live transcript{RESET} {DIM}— loading whisper "
+          f"large-v3-turbo…{RESET}", flush=True)
+    try:
+        model = WhisperModel(MODEL, device="cuda", compute_type="float16")
+        where = "GPU"
+    except Exception as e:
+        print(f"{DIM}cuda unavailable ({e}); CPU{RESET}", flush=True)
+        model = WhisperModel(MODEL, device="cpu", compute_type="int8",
+                             cpu_threads=os.cpu_count())
+        where = "CPU"
+
+    dev = device()
+    out = os.path.join(AUDIO_DIR, datetime.datetime.now().strftime(
+        "%Y-%m-%d_%H%M") + ".live.txt")
+    os.makedirs(AUDIO_DIR, exist_ok=True)
+    log = open(out, "a", buffering=1)
+    print(f"{DIM}{where} · {dev} · appending to {out} · ctrl-c to quit{RESET}\n",
+          flush=True)
+
+    proc = subprocess.Popen(
+        ["ffmpeg", "-nostdin", "-loglevel", "quiet", "-f", "pulse", "-i", dev,
+         "-ac", "1", "-ar", str(RATE), "-f", "s16le", "-"],
+        stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+
+    floor = None
+    buf, pre = [], []
+    speaking, quiet_for, said = False, 0.0, ""
+    nbytes = FRAME * 2
+    dt = FRAME / RATE
+    t_start = time.time()
+
+    def flush(chunk):
+        nonlocal said
+        audio = np.concatenate(chunk).astype(np.float32) / 32768.0
+        if len(audio) < RATE * 0.8:
+            return
+        segs, _ = model.transcribe(
+            audio, language="en", beam_size=1, vad_filter=True,
+            condition_on_previous_text=False,
+            initial_prompt=said[-300:] or None)
+        text = " ".join(s.text.strip() for s in segs).strip()
+        if not text:
+            return
+        said = (said + " " + text)[-600:]
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        body = textwrap.fill(text, width=max(40, width - 11),
+                             subsequent_indent=" " * 11)
+        print(f"{AMBER}{stamp}{RESET} {body}\n", flush=True)
+        log.write(f"[{stamp}] {text}\n")
+
+    try:
+        while True:
+            raw = proc.stdout.read(nbytes)
+            if not raw or len(raw) < nbytes:
+                break
+            f = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+            rms = math.sqrt(float(np.mean(f * f)) + 1e-9)
+            floor = rms if floor is None else (
+                min(floor * 1.02, rms) if rms < floor else floor * 0.9999 + rms * 0.0001)
+            loud = rms > max(floor * 3.5, 120.0)
+
+            if loud:
+                if not speaking:
+                    speaking = True
+                    buf = list(pre)
+                buf.append(f)
+                quiet_for = 0.0
+            elif speaking:
+                buf.append(f)
+                quiet_for += dt
+            else:
+                pre.append(f)
+                if len(pre) > int(PREROLL / dt):
+                    pre.pop(0)
+
+            if speaking:
+                held = len(buf) * dt
+                if (quiet_for >= SIL_HANG and held >= MIN_CHUNK) or held >= MAX_CHUNK:
+                    chunk, buf = buf, []
+                    speaking, quiet_for, pre = False, 0.0, []
+                    flush(chunk)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if speaking and buf:
+            flush(buf)
+        proc.terminate()
+        mins = (time.time() - t_start) / 60
+        print(f"\n{DIM}live transcript ended after {mins:.0f} min — {out}{RESET}")
+
+
+if __name__ == "__main__":
+    main()

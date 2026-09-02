@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.ogg
+*.wav
+*.live.txt
+config.json

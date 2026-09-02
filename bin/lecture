@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""lecture — record a class, transcribe it locally, drop the notes in the vault.
+
+  lecture            start recording (course auto-detected from the schedule)
+                     ...or show status if already recording
+  lecture stop       stop + transcribe + write the vault note
+  lecture start PHYS-101
+  lecture transcribe FILE [COURSE]
+  lecture mic [NAME|list]   pick/see the input device
+"""
+import os, sys, glob, json, signal, subprocess, time, datetime, re
+
+HOME = os.path.expanduser("~")
+
+# --------------------------------------------------------------- config
+# Everything personal lives in a config file, not in this script.
+# See config.example.json.  Override the path with $SCRIBE_CONFIG.
+CONFIG_PATH = os.path.expanduser(
+    os.environ.get("SCRIBE_CONFIG", "~/.config/scribe/config.json"))
+
+DEFAULTS = {
+    "audio_dir": "~/lectures",
+    "vault": "~/vault/Lectures",
+    "model": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+    "device": "default",
+    "courses": [],
+    # [{"course": "PHYS-101", "days": [0, 2, 4], "start": "10:20",
+    #   "end": "11:15"}] — days are 0=Mon .. 6=Sun
+    "schedule": [],
+    "grace_before_min": 25,
+    "grace_after_min": 20,
+}
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"warning: ignoring bad config {CONFIG_PATH}: {e}",
+              file=sys.stderr)
+    cfg["audio_dir"] = os.path.expanduser(cfg["audio_dir"])
+    cfg["vault"] = os.path.expanduser(cfg["vault"])
+    return cfg
+
+
+def save_config(**kw):
+    cfg = {}
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+    except Exception:
+        pass
+    cfg.update(kw)
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+CFG = load_config()
+AUDIO_DIR = CFG["audio_dir"]
+VAULT = CFG["vault"]
+MODEL = CFG["model"]
+
+STATE = os.path.join(AUDIO_DIR, ".state.json")
+
+
+def _hm(s):
+    h, m = s.split(":")
+    return int(h) * 60 + int(m)
+
+
+def guess_course(now=None):
+    """Nearest scheduled class to `now`, or "Lecture" if nothing is close."""
+    now = now or datetime.datetime.now()
+    mins = now.hour * 60 + now.minute
+    before, after = CFG["grace_before_min"], CFG["grace_after_min"]
+    best, dist = None, 10 ** 9
+    for entry in CFG["schedule"]:
+        if now.weekday() not in entry.get("days", []):
+            continue
+        s, e = _hm(entry["start"]), _hm(entry["end"])
+        if s - before <= mins <= e + after:
+            d = 0 if s <= mins <= e else min(abs(mins - s), abs(mins - e))
+            if d < dist:
+                best, dist = entry["course"], d
+    return best or "Lecture"
+
+
+def load(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(obj, f)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def sources():
+    out = subprocess.run(["pactl", "-f", "json", "list", "sources"],
+                         capture_output=True, text=True).stdout
+    try:
+        return [(s["name"], s.get("description", "")) for s in json.loads(out)]
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------- recording
+def cmd_start(course=None):
+    st = load(STATE)
+    if st and alive(st["pid"]):
+        return cmd_status()
+    course = course or guess_course()
+    os.makedirs(AUDIO_DIR, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+    path = os.path.join(AUDIO_DIR, f"{stamp}_{course}.ogg")
+    dev = load_config().get("device", "default")
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "pulse", "-i", dev,
+           "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "24k", path]
+    log = open(os.path.join(AUDIO_DIR, ".ffmpeg.log"), "ab")
+    p = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+    time.sleep(1.0)
+    if p.poll() is not None:
+        sys.exit(f"recorder died immediately — see {AUDIO_DIR}/.ffmpeg.log")
+    save(STATE, {"pid": p.pid, "file": path, "course": course,
+                 "started": time.time()})
+    print(f"● recording {course} → {path}\n  stop with:  lecture stop")
+
+
+def cmd_status():
+    st = load(STATE)
+    if not st or not alive(st["pid"]):
+        print("not recording.  `lecture` starts one.")
+        return
+    mins = (time.time() - st["started"]) / 60
+    size = os.path.getsize(st["file"]) / 1e6 if os.path.exists(st["file"]) else 0
+    print(f"● recording {st['course']} — {mins:.0f} min, {size:.1f} MB\n"
+          f"  {st['file']}\n  stop with:  lecture stop")
+
+
+def cmd_stop():
+    st = load(STATE)
+    if not st:
+        sys.exit("not recording.")
+    if alive(st["pid"]):
+        os.kill(st["pid"], signal.SIGINT)
+        for _ in range(50):
+            if not alive(st["pid"]):
+                break
+            time.sleep(0.2)
+    os.remove(STATE)
+    mins = (time.time() - st["started"]) / 60
+    print(f"■ stopped after {mins:.0f} min — transcribing…")
+    transcribe(st["file"], st["course"])
+
+
+# ------------------------------------------------------------- transcription
+def _reexec_with_cuda(argv):
+    """ctranslate2 needs the pip CUDA libs on LD_LIBRARY_PATH, which only the
+    dynamic loader reads at exec time — so re-exec ourselves once, with the
+    explicit argv the caller wants (never the original one)."""
+    libs = sorted(glob.glob(os.path.join(
+        HOME, ".local/lib/python3*/site-packages/nvidia/*/lib")))
+    if not libs or os.environ.get("_LECTURE_CUDA"):
+        return
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = ":".join(libs + [env.get("LD_LIBRARY_PATH", "")])
+    env["_LECTURE_CUDA"] = "1"
+    sys.stdout.flush()
+    os.execve(sys.executable,
+              [sys.executable, os.path.abspath(__file__)] + argv, env)
+
+
+def blocks(segments, span=45.0):
+    """Merge whisper segments into ~45s paragraphs."""
+    cur, start = [], None
+    for s in segments:
+        if start is None:
+            start = s.start
+        cur.append(s.text.strip())
+        if s.end - start >= span:
+            yield start, " ".join(cur)
+            cur, start = [], None
+    if cur:
+        yield start, " ".join(cur)
+
+
+def transcribe(path, course=None):
+    course = course or (re.split(r"_", os.path.basename(path))[-1]
+                        .rsplit(".", 1)[0])
+    _reexec_with_cuda(["transcribe", os.path.abspath(path), course])
+    from faster_whisper import WhisperModel
+    try:
+        model = WhisperModel(MODEL, device="cuda", compute_type="float16")
+        where = "GPU"
+    except Exception as e:
+        print(f"  (cuda unavailable: {e}; falling back to CPU)")
+        model = WhisperModel(MODEL, device="cpu", compute_type="int8",
+                             cpu_threads=os.cpu_count())
+        where = "CPU"
+    t0 = time.time()
+    segs, info = model.transcribe(path, language="en", beam_size=1,
+                                  vad_filter=True,
+                                  vad_parameters={"min_silence_duration_ms": 700},
+                                  condition_on_previous_text=False)
+    body, words = [], 0
+    for start, text in blocks(segs):
+        body.append(f"**{int(start)//60:02d}:{int(start)%60:02d}** {text}")
+        words += len(text.split())
+        print(".", end="", flush=True)
+    print()
+    dur = info.duration
+    date = datetime.datetime.fromtimestamp(os.path.getmtime(path))
+    os.makedirs(VAULT, exist_ok=True)
+    note = os.path.join(VAULT, f"{date:%Y-%m-%d} {course}.md")
+    n = 2
+    while os.path.exists(note):
+        note = os.path.join(VAULT, f"{date:%Y-%m-%d} {course} ({n}).md")
+        n += 1
+    with open(note, "w") as f:
+        f.write(f"---\ncourse: {course}\ndate: {date:%Y-%m-%d}\n"
+                f"duration_min: {dur/60:.0f}\naudio: \"{path}\"\n"
+                f"tags:\n  - college/lecture\n---\n\n"
+                f"# {course} — {date:%a %b %-d, %Y}\n\n"
+                f"Raw auto-transcript (whisper large-v3-turbo, local). "
+                f"Unedited — treat names and jargon as suspect.\n\n"
+                + "\n\n".join(body) + "\n")
+    el = time.time() - t0
+    print(f"✓ {words} words, {dur/60:.0f} min audio in {el:.0f}s "
+          f"({dur/el:.0f}x realtime, {where})\n  {note}")
+
+
+# --------------------------------------------------------------------- mic
+def cmd_mic(name=None):
+    srcs = sources()
+    cur = load_config().get("device", "default")
+    if not name or name == "list":
+        print(f"current: {cur}\n")
+        for n, d in srcs:
+            print(f"  {'*' if n == cur else ' '} {n}\n      {d}")
+        print("\n  lecture mic <name>   (substring is enough)")
+        return
+    hit = [n for n, d in srcs if name.lower() in (n + " " + d).lower()]
+    if not hit:
+        sys.exit(f"no input matching {name!r} — try `lecture mic list`")
+    save_config(device=hit[0])
+    print(f"input set to {hit[0]}")
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if not a:
+        cmd_start()
+    elif a[0] == "start":
+        cmd_start(a[1] if len(a) > 1 else None)
+    elif a[0] in ("stop", "end"):
+        cmd_stop()
+    elif a[0] in ("status", "st"):
+        cmd_status()
+    elif a[0] in ("transcribe", "tr"):
+        transcribe(a[1], a[2] if len(a) > 2 else None)
+    elif a[0] == "mic":
+        cmd_mic(a[1] if len(a) > 1 else None)
+    else:
+        sys.exit(__doc__)

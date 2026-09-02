@@ -1,0 +1,17 @@
+{
+  "audio_dir": "~/lectures",
+  "vault": "~/vault/Lectures",
+  "model": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+  "device": "default",
+
+  "courses": ["PHYS-101", "HIST-210"],
+
+  "_schedule": "days are 0=Mon .. 6=Sun; used to pre-select the class",
+  "schedule": [
+    {"course": "PHYS-101", "days": [0, 2, 4], "start": "10:20", "end": "11:15"},
+    {"course": "HIST-210", "days": [1, 3],    "start": "13:00", "end": "14:25"}
+  ],
+
+  "grace_before_min": 25,
+  "grace_after_min": 20
+}
